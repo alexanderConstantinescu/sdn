@@ -10,6 +10,7 @@ import (
 
 	"k8s.io/klog/v2"
 
+	v1 "k8s.io/api/core/v1"
 	ktypes "k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -19,6 +20,7 @@ import (
 
 	networkv1 "github.com/openshift/api/network/v1"
 	networkinformers "github.com/openshift/client-go/network/informers/externalversions/network/v1"
+	kcoreinformers "k8s.io/client-go/informers/core/v1"
 )
 
 type NodeEgress struct {
@@ -30,7 +32,9 @@ type NodeEgress struct {
 	requestedCIDRs sets.String
 	parsedCIDRs    map[string]*net.IPNet
 
-	offline bool
+	activeEgressIPs sets.String
+	offline         bool
+	retries         int
 }
 
 type namespaceEgress struct {
@@ -60,7 +64,7 @@ type egressIPInfo struct {
 type EgressIPWatcher interface {
 	Synced()
 
-	ClaimEgressIP(vnid uint32, egressIP, nodeIP string)
+	ClaimEgressIP(vnid uint32, egressIP, nodeIP, nodeName string)
 	ReleaseEgressIP(egressIP, nodeIP string)
 
 	SetNamespaceEgressNormal(vnid uint32)
@@ -75,11 +79,14 @@ type EgressIPTracker struct {
 
 	watcher EgressIPWatcher
 
+	nodeInformer     kcoreinformers.NodeInformer
 	nodes            map[ktypes.UID]*NodeEgress
 	nodesByNodeIP    map[string]*NodeEgress
 	namespacesByVNID map[uint32]*namespaceEgress
 	egressIPs        map[string]*egressIPInfo
 	nodesWithCIDRs   int
+	monitorNodes     map[string]*NodeEgress
+	stop             chan struct{}
 
 	changedEgressIPs  map[*egressIPInfo]bool
 	changedNamespaces map[*namespaceEgress]bool
@@ -94,20 +101,23 @@ func NewEgressIPTracker(watcher EgressIPWatcher) *EgressIPTracker {
 		nodesByNodeIP:    make(map[string]*NodeEgress),
 		namespacesByVNID: make(map[uint32]*namespaceEgress),
 		egressIPs:        make(map[string]*egressIPInfo),
+		monitorNodes:     make(map[string]*NodeEgress),
 
 		changedEgressIPs:  make(map[*egressIPInfo]bool),
 		changedNamespaces: make(map[*namespaceEgress]bool),
 	}
 }
 
-func (eit *EgressIPTracker) Start(hostSubnetInformer networkinformers.HostSubnetInformer, netNamespaceInformer networkinformers.NetNamespaceInformer) {
+func (eit *EgressIPTracker) Start(hostSubnetInformer networkinformers.HostSubnetInformer, netNamespaceInformer networkinformers.NetNamespaceInformer, nodeInformer kcoreinformers.NodeInformer) {
 	eit.watchHostSubnets(hostSubnetInformer)
 	eit.watchNetNamespaces(netNamespaceInformer)
+	eit.nodeInformer = nodeInformer
 
 	go func() {
 		cache.WaitForCacheSync(utilwait.NeverStop,
 			hostSubnetInformer.Informer().HasSynced,
-			netNamespaceInformer.Informer().HasSynced)
+			netNamespaceInformer.Informer().HasSynced,
+			nodeInformer.Informer().HasSynced)
 
 		eit.Lock()
 		defer eit.Unlock()
@@ -290,6 +300,158 @@ func (eit *EgressIPTracker) UpdateHostSubnetEgress(hs *networkv1.HostSubnet) {
 	eit.syncEgressIPs()
 }
 
+func nodeIsReady(node *v1.Node) bool {
+	for _, cond := range node.Status.Conditions {
+		if cond.Type == v1.NodeReady {
+			if cond.Status == v1.ConditionFalse || cond.Status == v1.ConditionUnknown {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// FIXME: currently SetMonitorNodes/GetMonitorNodes/AddEgressIP and
+// ReleaseEgressIP all assume that the tracker lock is already held. This
+// enforces some knowledge regarding the chain of execution for egress IP
+// related setup. This is not great, since the API shouldn't make assumptions
+// about the lock and enforce indirect conditions on the caller's side. This
+// should ideally be re-worked so that all of these functions acquire the lock
+// themselves.
+
+// SetMonitorNodes updates EgressIPTracker with the node data provided and
+// starts a go-routine (if one is not already running) which polls monitorNodes
+// to check if they are ready and reachable. It assumes the lock is held.
+func (eit *EgressIPTracker) SetMonitorNodes(monitorNodes map[string]*NodeEgress) {
+	eit.monitorNodes = monitorNodes
+	if len(monitorNodes) > 0 {
+		if eit.stop == nil {
+			eit.stop = make(chan struct{})
+			go utilwait.PollUntil(defaultPollInterval, eit.poll, eit.stop)
+		}
+	} else {
+		if eit.stop != nil {
+			close(eit.stop)
+			eit.stop = nil
+		}
+	}
+}
+
+// GetMonitorNodes gets the node data from EgressIPTracker.
+// It assumes the lock is held.
+func (eit *EgressIPTracker) GetMonitorNodes() map[string]*NodeEgress {
+	return eit.monitorNodes
+}
+
+// AddEgressIP assumes the EgressIPTracker lock is already held. The access to
+// this function call is currently percolated down from `syncEgressIPs`, which
+// always has the lock held. It starts a go-routine (if one is not already
+// running) which polls monitorNodes to check if they are ready and reachable
+func (eit *EgressIPTracker) AddEgressIP(nodeIP, nodeName, egressIP string) {
+	if eit.monitorNodes[nodeIP] != nil {
+		eit.monitorNodes[nodeIP].activeEgressIPs.Insert(egressIP)
+		return
+	}
+	klog.V(4).Infof("Monitoring node %s", nodeIP)
+
+	eit.monitorNodes[nodeIP] = &NodeEgress{
+		NodeIP:          nodeIP,
+		activeEgressIPs: sets.NewString(egressIP),
+		NodeName:        nodeName,
+	}
+	if len(eit.monitorNodes) == 1 && eit.stop == nil {
+		eit.stop = make(chan struct{})
+		go utilwait.PollUntil(defaultPollInterval, eit.poll, eit.stop)
+	}
+}
+
+// This function assumes the EgressIPTracker lock is already held. The access to
+// this function call is currently percolated down from `syncEgressIPs`, which
+// always has the lock held. It stops the running go-routine which polls
+// monitorNodes to check if they are ready and reachable (if there is one
+// running)
+func (eit *EgressIPTracker) RemoveEgressIP(nodeIP, egressIP string) {
+	if eit.monitorNodes[nodeIP] == nil {
+		return
+	}
+	eit.monitorNodes[nodeIP].activeEgressIPs.Delete(egressIP)
+	if eit.monitorNodes[nodeIP].activeEgressIPs.Len() == 0 {
+		klog.V(4).Infof("Unmonitoring node %s", nodeIP)
+		delete(eit.monitorNodes, nodeIP)
+		if len(eit.monitorNodes) == 0 && eit.stop != nil {
+			close(eit.stop)
+			eit.stop = nil
+		}
+	}
+}
+
+const (
+	defaultPollInterval = 5 * time.Second
+	repollInterval      = time.Second
+	maxRetries          = 2
+)
+
+func (eit *EgressIPTracker) poll() (bool, error) {
+	retry := eit.check(false)
+	for retry {
+		time.Sleep(repollInterval)
+		retry = eit.check(true)
+	}
+	return false, nil
+}
+
+func (eit *EgressIPTracker) check(retrying bool) bool {
+	eit.Lock()
+	defer eit.Unlock()
+
+	var timeout time.Duration
+	if retrying {
+		timeout = repollInterval
+	} else {
+		timeout = defaultPollInterval
+	}
+
+	needRetry := false
+	for _, node := range eit.monitorNodes {
+		if retrying && node.retries == 0 {
+			continue
+		}
+
+		nn, err := eit.nodeInformer.Lister().Get(node.NodeName)
+		if err != nil {
+			return false
+		}
+
+		if !nodeIsReady(nn) {
+			klog.Warningf("Node %s is not Ready", node.NodeName)
+			node.offline = true
+			eit.SetNodeOffline(node.NodeIP, true)
+			// Return when there's a not Ready node
+			return false
+		}
+
+		online := eit.Ping(node.NodeIP, timeout)
+		if node.offline && online {
+			klog.Infof("Node %s is back online", node.NodeIP)
+			node.offline = false
+			eit.SetNodeOffline(node.NodeIP, false)
+		} else if !node.offline && !online {
+			node.retries++
+			if node.retries > maxRetries {
+				klog.Warningf("Node %s is offline", node.NodeIP)
+				node.retries = 0
+				node.offline = true
+				eit.SetNodeOffline(node.NodeIP, true)
+			} else {
+				klog.V(2).Infof("Node %s may be offline... retrying", node.NodeIP)
+				needRetry = true
+			}
+		}
+	}
+
+	return needRetry
+}
+
 func (eit *EgressIPTracker) watchNetNamespaces(netNamespaceInformer networkinformers.NetNamespaceInformer) {
 	funcs := InformerFuncs(&networkv1.NetNamespace{}, eit.handleAddOrUpdateNetNamespace, eit.handleDeleteNetNamespace)
 	netNamespaceInformer.Informer().AddEventHandler(funcs)
@@ -412,7 +574,7 @@ func (eit *EgressIPTracker) syncEgressNodeState(eg *egressIPInfo, active bool) {
 	if active && eg.assignedNodeIP != eg.nodes[0].NodeIP {
 		klog.V(4).Infof("Assigning egress IP %s to node %s", eg.ip, eg.nodes[0].NodeIP)
 		eg.assignedNodeIP = eg.nodes[0].NodeIP
-		eit.watcher.ClaimEgressIP(eg.namespaces[0].vnid, eg.ip, eg.assignedNodeIP)
+		eit.watcher.ClaimEgressIP(eg.namespaces[0].vnid, eg.ip, eg.assignedNodeIP, eg.nodes[0].NodeName)
 	} else if !active && eg.assignedNodeIP != "" {
 		klog.V(4).Infof("Removing egress IP %s from node %s", eg.ip, eg.assignedNodeIP)
 		eit.watcher.ReleaseEgressIP(eg.ip, eg.assignedNodeIP)
@@ -470,10 +632,8 @@ func (eit *EgressIPTracker) syncEgressNamespaceState(ns *namespaceEgress) {
 	}
 }
 
+// Assumes the EgressIPTracker lock is held.
 func (eit *EgressIPTracker) SetNodeOffline(nodeIP string, offline bool) {
-	eit.Lock()
-	defer eit.Unlock()
-
 	node := eit.nodesByNodeIP[nodeIP]
 	if node == nil {
 		return
@@ -495,9 +655,6 @@ func (eit *EgressIPTracker) SetNodeOffline(nodeIP string, offline bool) {
 }
 
 func (eit *EgressIPTracker) lookupNodeIP(ip string) string {
-	eit.Lock()
-	defer eit.Unlock()
-
 	if node := eit.nodesByNodeIP[ip]; node != nil {
 		return node.sdnIP
 	}
