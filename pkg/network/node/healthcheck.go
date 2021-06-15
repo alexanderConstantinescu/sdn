@@ -38,10 +38,10 @@ func waitForOVS(network, addr string) error {
 	return utilwait.PollImmediate(time.Second, time.Minute, func() (bool, error) {
 		dialErr, pingErr := dialAndPing(network, addr)
 		if dialErr != nil {
-			klog.V(2).Infof("waiting for OVS to start: %v", dialErr)
+			klog.Warningf("waiting for OVS to start: %v", dialErr)
 			return false, nil
 		} else if pingErr != nil {
-			klog.V(2).Infof("waiting for OVS to start, ping failed: %v", pingErr)
+			klog.Warningf("waiting for OVS to start, ping failed: %v", pingErr)
 			return false, nil
 		}
 		return true, nil
